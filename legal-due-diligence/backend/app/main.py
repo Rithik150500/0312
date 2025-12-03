@@ -16,12 +16,14 @@ from typing import List, Dict, Any
 from uuid import uuid4
 import logging
 import asyncio
+import os
 
 from .config import settings
 from .database import init_db, get_db
 from .models import Session, Document, DocumentPage, SessionStatus
 from .websocket.connection_manager import manager
 from .services.agent_service import LegalDueDiligenceAgent
+from .services.document_service import DocumentService
 from .middleware.approval import ApprovalContextBuilder, APPROVAL_REQUIRED_TOOLS
 
 logging.basicConfig(level=logging.INFO)
@@ -61,26 +63,53 @@ async def upload_document(file: UploadFile = File(...)):
     """
     Upload a legal document to the data room.
 
-    This would:
-    1. Save to S3/MinIO
-    2. Extract text from PDF
-    3. Generate page summaries
-    4. Identify legally significant pages
-    5. Create database records
+    Process:
+    1. Save uploaded file temporarily
+    2. Extract all pages as images and text
+    3. Analyze each page with Claude Haiku (image + text)
+    4. Combine page summaries
+    5. Analyze document with Claude Haiku (get summary + legally significant pages)
+    6. Upload to S3/MinIO
+    7. Store in database
     """
     logger.info(f"Uploading document: {file.filename}")
 
-    # For now, return mock data
-    # In production, this would process the PDF
-    doc_id = str(uuid4())[:8]
+    # Validate file type
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    return {
-        "id": doc_id,
-        "filename": file.filename,
-        "summary": "Sample legal document (processing required)",
-        "pages": 10,
-        "uploaded_at": "2024-01-01T00:00:00"
-    }
+    # Save uploaded file temporarily
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+        content = await file.read()
+        temp_file.write(content)
+        temp_file_path = temp_file.name
+
+    try:
+        # Process document
+        doc_service = DocumentService()
+
+        async with get_db() as db:
+            document = await doc_service.process_document(
+                file_path=temp_file_path,
+                filename=file.filename,
+                db_session=db
+            )
+
+        # Return document info
+        return {
+            "id": document.id,
+            "filename": document.filename,
+            "summary": document.summary,
+            "pages": document.page_count,
+            "uploaded_at": document.uploaded_at.isoformat()
+        }
+
+    finally:
+        # Clean up temp file
+        import os
+        if os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
 
 
 @app.get("/api/documents")
@@ -141,6 +170,71 @@ async def get_document_pdf(document_id: str):
     """Get PDF file for a document."""
     # In production, this would fetch from S3
     raise HTTPException(status_code=501, detail="PDF retrieval not implemented")
+
+
+@app.post("/api/documents/process-folder")
+async def process_folder(data: Dict[str, Any]):
+    """
+    Process all PDF documents in a folder.
+
+    Args:
+        folder_path: Path to folder containing PDFs
+
+    Returns:
+        List of processed document IDs
+    """
+    folder_path = data.get("folder_path")
+
+    if not folder_path or not os.path.exists(folder_path):
+        raise HTTPException(status_code=400, detail="Invalid folder path")
+
+    logger.info(f"Processing folder: {folder_path}")
+
+    # Get all PDF files in folder
+    import glob
+    pdf_files = glob.glob(os.path.join(folder_path, "*.pdf"))
+
+    if not pdf_files:
+        return {"message": "No PDF files found in folder", "processed": []}
+
+    logger.info(f"Found {len(pdf_files)} PDF files")
+
+    # Process each document
+    doc_service = DocumentService()
+    processed_docs = []
+
+    for pdf_path in pdf_files:
+        filename = os.path.basename(pdf_path)
+        logger.info(f"Processing: {filename}")
+
+        try:
+            async with get_db() as db:
+                document = await doc_service.process_document(
+                    file_path=pdf_path,
+                    filename=filename,
+                    db_session=db
+                )
+
+            processed_docs.append({
+                "id": document.id,
+                "filename": document.filename,
+                "summary": document.summary,
+                "pages": document.page_count
+            })
+
+            logger.info(f"Successfully processed: {filename}")
+
+        except Exception as e:
+            logger.error(f"Failed to process {filename}: {e}")
+            processed_docs.append({
+                "filename": filename,
+                "error": str(e)
+            })
+
+    return {
+        "message": f"Processed {len(processed_docs)} documents",
+        "processed": processed_docs
+    }
 
 
 # ============================================================================
