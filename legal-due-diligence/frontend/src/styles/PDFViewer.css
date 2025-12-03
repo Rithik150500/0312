@@ -1,0 +1,207 @@
+.pdf-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.pdf-empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #95a5a6;
+}
+
+.empty-icon {
+  font-size: 48px;
+  margin-bottom: 10px;
+}
+
+.pdf-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  padding: 10px 15px;
+  border-bottom: 1px solid #eee;
+  background: #fafafa;
+}
+
+.toolbar-btn {
+  padding: 6px 12px;
+  border: 1px solid #ddd;
+  background: white;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.2s;
+}
+
+.toolbar-btn:hover:not(:disabled) {
+  background: #f5f5f5;
+  border-color: #3498db;
+}
+
+.toolbar-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.page-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.page-indicator {
+  font-size: 13px;
+  color: #2c3e50;
+}
+
+.page-badge {
+  padding: 4px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.page-badge.highlighted {
+  background: #f39c12;
+  color: white;
+}
+
+.page-badge.significant {
+  background: #e74c3c;
+  color: white;
+}
+
+.pdf-content {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.pdf-sidebar {
+  width: 250px;
+  border-right: 1px solid #eee;
+  display: flex;
+  flex-direction: column;
+  background: #fafafa;
+}
+
+.sidebar-header {
+  padding: 10px 12px;
+  border-bottom: 1px solid #eee;
+}
+
+.sidebar-header h4 {
+  font-size: 14px;
+  color: #2c3e50;
+}
+
+.page-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.page-item {
+  padding: 8px;
+  margin-bottom: 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid #eee;
+  background: white;
+  transition: all 0.2s;
+}
+
+.page-item:hover {
+  border-color: #3498db;
+}
+
+.page-item.active {
+  background: #e3f2fd;
+  border-color: #2196f3;
+}
+
+.page-item.highlighted {
+  background: #fff3cd;
+  border-color: #f39c12;
+}
+
+.page-item.significant {
+  border-left: 3px solid #e74c3c;
+}
+
+.page-item-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.page-num {
+  font-weight: 600;
+  font-size: 12px;
+  color: #2c3e50;
+}
+
+.mini-badge {
+  font-size: 12px;
+}
+
+.page-summary {
+  font-size: 11px;
+  color: #7f8c8d;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.pdf-display {
+  flex: 1;
+  overflow: auto;
+  padding: 20px;
+  background: #e0e0e0;
+}
+
+.pdf-page {
+  background: white;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  padding: 40px;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.pdf-page.page-highlighted {
+  box-shadow: 0 0 0 4px #f39c12;
+}
+
+.pdf-page.page-significant {
+  box-shadow: 0 0 0 4px #e74c3c;
+}
+
+.pdf-placeholder {
+  text-align: center;
+  color: #7f8c8d;
+  padding: 60px 20px;
+}
+
+.pdf-placeholder p {
+  font-size: 18px;
+  margin-bottom: 10px;
+}
+
+.pdf-note {
+  font-size: 12px !important;
+  font-style: italic;
+}
+
+.pdf-loading {
+  text-align: center;
+  padding: 40px;
+  color: #7f8c8d;
+}
