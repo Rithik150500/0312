@@ -132,13 +132,39 @@ Human approval required for:
 
 ## 🚀 Getting Started
 
+### ⚡ Quick Start (5 Minutes)
+
+```bash
+# 1. Clone and configure
+git clone <repository-url>
+cd legal-due-diligence
+cp backend/.env.example backend/.env
+# Add your ANTHROPIC_API_KEY to backend/.env
+
+# 2. Start everything
+docker-compose up -d
+
+# 3. Open browser
+# Frontend: http://localhost:3000
+# API Docs: http://localhost:8000/docs
+```
+
+**First upload:**
+```bash
+curl -X POST http://localhost:8000/api/documents/upload \
+  -F "file=@contract.pdf"
+```
+
+👉 **See [QUICKSTART.md](./QUICKSTART.md) for detailed 5-minute setup guide**
+
 ### Prerequisites
 
 - Docker and Docker Compose
-- Node.js 20+ (for local frontend development)
-- Python 3.11+ (for local backend development)
+- Anthropic API key ([Get one here](https://console.anthropic.com/))
+- Node.js 20+ (optional, for local frontend development)
+- Python 3.11+ (optional, for local backend development)
 
-### Quick Start with Docker
+### Full Setup with Docker
 
 1. Clone the repository:
 ```bash
