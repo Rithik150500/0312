@@ -1,0 +1,1109 @@
+# Web Application Implementation
+
+I'll build out the complete web application with working code. Let's focus on the critical components.
+
+## Project Structure
+
+```
+legal-due-diligence/
+├── backend/
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   ├── models.py
+│   │   ├── services/
+│   │   │   ├── agent_service.py
+│   │   │   ├── document_service.py
+│   │   │   └── approval_service.py
+│   │   ├── tools/
+│   │   │   └── data_room_tools.py
+│   │   ├── websocket/
+│   │   │   └── connection_manager.py
+│   │   └── context_builder.py
+│   ├── requirements.txt
+│   └── alembic/
+├── frontend/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── MainLayout.tsx
+│   │   │   ├── DocumentList.tsx
+│   │   │   ├── PDFViewer.tsx
+│   │   │   ├── ApprovalPanel.tsx
+│   │   │   ├── WorkflowPanel.tsx
+│   │   │   ├── TodoPanel.tsx
+│   │   │   ├── FileList.tsx
+│   │   │   └── FileEditor.tsx
+│   │   ├── stores/
+│   │   │   └── appStore.ts
+│   │   ├── api/
+│   │   │   └── client.ts
+│   │   └── App.tsx
+│   ├── package.json
+│   └── tsconfig.json
+└── docker-compose.yml
+```
+
+## Backend Core Implementation
+
+### Configuration and Database
+
+```python
+# backend/app/config.py
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    DATABASE_URL: str = "postgresql+asyncpg://user:pass@localhost/legaldd"
+    REDIS_URL: str = "redis://localhost:6379"
+    ANTHROPIC_API_KEY: str
+    S3_BUCKET: str = "legal-documents"
+    S3_ENDPOINT: str = "http://localhost:9000"
+    S3_ACCESS_KEY: str
+    S3_SECRET_KEY: str
+    ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
+    
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+```python
+# backend/app/database.py
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
+from contextlib import asynccontextmanager
+
+engine = create_async_engine(settings.DATABASE_URL, echo=True)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+Base = declarative_base()
+
+@asynccontextmanager
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+```
+
+### Database Models
+
+```python
+# backend/app/models.py
+from sqlalchemy import Column, String, Integer, Boolean, DateTime, Text, ForeignKey, JSON
+from sqlalchemy.orm import relationship
+from datetime import datetime
+import enum
+
+from .database import Base
+
+class SessionStatus(str, enum.Enum):
+    CREATED = "created"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class Session(Base):
+    __tablename__ = "sessions"
+    
+    id = Column(String, primary_key=True)
+    project_name = Column(String, nullable=False)
+    status = Column(String, default=SessionStatus.CREATED)
+    document_ids = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+class Document(Base):
+    __tablename__ = "documents"
+    
+    id = Column(String, primary_key=True)
+    filename = Column(String, nullable=False)
+    file_hash = Column(String, unique=True, index=True)
+    summary = Column(Text)
+    page_count = Column(Integer)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+    
+    pages = relationship("DocumentPage", back_populates="document")
+
+class DocumentPage(Base):
+    __tablename__ = "document_pages"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    document_id = Column(String, ForeignKey("documents.id"))
+    page_num = Column(Integer, nullable=False)
+    text = Column(Text)
+    summary = Column(Text)
+    legally_significant = Column(Boolean, default=False)
+    image_path = Column(String)
+    
+    document = relationship("Document", back_populates="pages")
+```
+
+### Data Room Tools
+
+```python
+# backend/app/tools/data_room_tools.py
+from langchain.tools import tool
+from typing import List
+import logging
+
+logger = logging.getLogger(__name__)
+
+def create_data_room_tools(document_service, session_id: str):
+    """Create data room tools with closure over document service and session."""
+    
+    @tool
+    async def list_data_room_documents() -> str:
+        """List all documents in the data room with IDs, summaries, and page counts.
+        Use this first to understand what documents are available."""
+        
+        logger.info(f"[{session_id}] Listing data room documents")
+        
+        async with get_db() as db:
+            documents = await document_service.list_all(db)
+        
+        result = []
+        for doc in documents:
+            result.append(
+                f"Document ID: {doc.id}\n"
+                f"Filename: {doc.filename}\n"
+                f"Summary: {doc.summary}\n"
+                f"Pages: {doc.page_count}"
+            )
+        
+        return "\n\n---\n\n".join(result)
+    
+    @tool
+    async def get_documents(doc_ids: List[str]) -> str:
+        """Get detailed information about specific documents including page summaries
+        and full text of legally significant pages.
+        
+        Args:
+            doc_ids: List of document IDs to retrieve
+        """
+        
+        logger.info(f"[{session_id}] Getting documents: {doc_ids}")
+        
+        async with get_db() as db:
+            documents = await document_service.get_by_ids(doc_ids, db)
+        
+        if not documents:
+            return "Error: No documents found with the provided IDs"
+        
+        result = []
+        for doc in documents:
+            # All page summaries
+            page_summaries = "\n".join([
+                f"Page {p.page_num}: {p.summary}"
+                for p in doc.pages
+            ])
+            
+            # Full text of legally significant pages
+            significant = [p for p in doc.pages if p.legally_significant]
+            significant_text = "\n\n---PAGE BREAK---\n\n".join([
+                f"Page {p.page_num}:\n{p.text}"
+                for p in significant
+            ])
+            
+            result.append(
+                f"DOCUMENT: {doc.filename} (ID: {doc.id})\n"
+                f"Summary: {doc.summary}\n\n"
+                f"PAGE SUMMARIES:\n{page_summaries}\n\n"
+                f"LEGALLY SIGNIFICANT PAGES:\n{significant_text}"
+            )
+        
+        return "\n\n=== NEXT DOCUMENT ===\n\n".join(result)
+    
+    @tool
+    async def get_page_text(doc_id: str, page_nums: List[int]) -> str:
+        """Get full text of specific pages from a document.
+        
+        Args:
+            doc_id: Document ID
+            page_nums: List of page numbers to retrieve
+        """
+        
+        logger.info(f"[{session_id}] Getting page text: {doc_id}, pages {page_nums}")
+        
+        async with get_db() as db:
+            doc = await document_service.get_by_id(doc_id, db)
+        
+        if not doc:
+            return f"Error: Document '{doc_id}' not found"
+        
+        result = []
+        for page_num in page_nums:
+            page = next((p for p in doc.pages if p.page_num == page_num), None)
+            if page:
+                result.append(f"Page {page_num}:\n{page.text}")
+            else:
+                result.append(f"Page {page_num}: NOT FOUND")
+        
+        return "\n\n---\n\n".join(result)
+    
+    @tool
+    async def get_page_image(doc_id: str, page_nums: List[int]) -> str:
+        """Get images of specific pages. Use sparingly - only for visual elements
+        like signatures, stamps, or complex layouts not captured in text.
+        
+        Args:
+            doc_id: Document ID
+            page_nums: List of page numbers to retrieve images for
+        """
+        
+        logger.info(f"[{session_id}] Getting page images: {doc_id}, pages {page_nums}")
+        
+        async with get_db() as db:
+            doc = await document_service.get_by_id(doc_id, db)
+        
+        if not doc:
+            return f"Error: Document '{doc_id}' not found"
+        
+        # Return image paths - the LLM will receive these as base64 via vision API
+        result = []
+        for page_num in page_nums:
+            page = next((p for p in doc.pages if p.page_num == page_num), None)
+            if page and page.image_path:
+                result.append(page.image_path)
+        
+        return "\n".join(result)
+    
+    return [
+        list_data_room_documents,
+        get_documents,
+        get_page_text,
+        get_page_image
+    ]
+```
+
+### WebSocket Connection Manager
+
+```python
+# backend/app/websocket/connection_manager.py
+from fastapi import WebSocket
+from typing import Dict
+import logging
+import json
+
+logger = logging.getLogger(__name__)
+
+class ConnectionManager:
+    """Manages WebSocket connections for real-time agent communication."""
+    
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+    
+    async def connect(self, session_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[session_id] = websocket
+        logger.info(f"WebSocket connected: {session_id}")
+    
+    def disconnect(self, session_id: str):
+        if session_id in self.active_connections:
+            del self.active_connections[session_id]
+            logger.info(f"WebSocket disconnected: {session_id}")
+    
+    async def disconnect_all(self):
+        for session_id in list(self.active_connections.keys()):
+            ws = self.active_connections[session_id]
+            await ws.close()
+            self.disconnect(session_id)
+    
+    async def send_update(self, session_id: str, message: dict):
+        """Send a general update message."""
+        if session_id in self.active_connections:
+            ws = self.active_connections[session_id]
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                logger.error(f"Failed to send update to {session_id}: {e}")
+                self.disconnect(session_id)
+    
+    async def send_approval_request(self, session_id: str, approval_context):
+        """Send an approval request to the frontend."""
+        message = {
+            "type": "approval_request",
+            "data": {
+                "request_id": approval_context.request_id,
+                "tool_name": approval_context.tool_name,
+                "tool_args": approval_context.tool_args,
+                "allowed_decisions": approval_context.allowed_decisions,
+                "document_highlights": [
+                    {
+                        "doc_id": dh.doc_id,
+                        "reason": dh.reason,
+                        "legally_significant_pages": dh.legally_significant_pages,
+                        "all_pages_summary": dh.all_pages_summary
+                    }
+                    for dh in approval_context.document_highlights
+                ],
+                "page_highlights": [
+                    {
+                        "doc_id": ph.doc_id,
+                        "page_nums": ph.page_nums,
+                        "context": ph.context
+                    }
+                    for ph in approval_context.page_highlights
+                ],
+                "file_highlights": [
+                    {
+                        "file_path": fh.file_path,
+                        "operation": fh.operation,
+                        "content_preview": fh.content_preview
+                    }
+                    for fh in approval_context.file_highlights
+                ],
+                "agent_reasoning": approval_context.agent_reasoning,
+                "related_todos": approval_context.related_todos
+            }
+        }
+        await self.send_update(session_id, message)
+```
+
+### Approval Context Builder
+
+```python
+# backend/app/context_builder.py
+from dataclasses import dataclass
+from typing import List, Dict, Any
+from uuid import uuid4
+from datetime import datetime
+
+@dataclass
+class DocumentHighlight:
+    doc_id: str
+    reason: str
+    legally_significant_pages: List[int]
+    all_pages_summary: Dict[int, str]
+
+@dataclass
+class PageHighlight:
+    doc_id: str
+    page_nums: List[int]
+    context: str
+
+@dataclass
+class FileHighlight:
+    file_path: str
+    operation: str
+    content_preview: str
+
+@dataclass
+class ApprovalContext:
+    request_id: str
+    tool_name: str
+    tool_args: Dict[str, Any]
+    allowed_decisions: List[str]
+    document_highlights: List[DocumentHighlight]
+    page_highlights: List[PageHighlight]
+    file_highlights: List[FileHighlight]
+    agent_reasoning: str
+    related_todos: List[str]
+    timestamp: str
+
+class ApprovalContextBuilder:
+    """Builds rich approval contexts from agent tool calls."""
+    
+    def __init__(self, document_service, session_id: str):
+        self.document_service = document_service
+        self.session_id = session_id
+    
+    async def build_context(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        conversation_history: List[Any]
+    ) -> ApprovalContext:
+        """Build approval context based on tool type."""
+        
+        if tool_name == "get_documents":
+            return await self._build_get_documents_context(tool_args, conversation_history)
+        elif tool_name == "get_page_text":
+            return await self._build_get_page_text_context(tool_args, conversation_history)
+        elif tool_name == "get_page_image":
+            return await self._build_get_page_image_context(tool_args, conversation_history)
+        elif tool_name in ["write_file", "edit_file"]:
+            return await self._build_file_context(tool_name, tool_args, conversation_history)
+        else:
+            return await self._build_generic_context(tool_name, tool_args, conversation_history)
+    
+    async def _build_get_documents_context(
+        self,
+        tool_args: Dict[str, Any],
+        conversation_history: List[Any]
+    ) -> ApprovalContext:
+        """Build context for get_documents approval."""
+        
+        doc_ids = tool_args["doc_ids"]
+        
+        async with get_db() as db:
+            documents = await self.document_service.get_by_ids(doc_ids, db)
+        
+        document_highlights = []
+        for doc in documents:
+            significant_pages = [p.page_num for p in doc.pages if p.legally_significant]
+            page_summaries = {p.page_num: p.summary for p in doc.pages}
+            
+            document_highlights.append(DocumentHighlight(
+                doc_id=doc.id,
+                reason=self._extract_reason(doc.id, conversation_history),
+                legally_significant_pages=significant_pages,
+                all_pages_summary=page_summaries
+            ))
+        
+        return ApprovalContext(
+            request_id=str(uuid4()),
+            tool_name="get_documents",
+            tool_args=tool_args,
+            allowed_decisions=["approve", "edit", "reject"],
+            document_highlights=document_highlights,
+            page_highlights=[],
+            file_highlights=[],
+            agent_reasoning=self._extract_reasoning(conversation_history),
+            related_todos=self._extract_todos(conversation_history),
+            timestamp=datetime.utcnow().isoformat()
+        )
+    
+    async def _build_get_page_text_context(
+        self,
+        tool_args: Dict[str, Any],
+        conversation_history: List[Any]
+    ) -> ApprovalContext:
+        """Build context for get_page_text approval."""
+        
+        doc_id = tool_args["doc_id"]
+        page_nums = tool_args["page_nums"]
+        
+        async with get_db() as db:
+            doc = await self.document_service.get_by_id(doc_id, db)
+        
+        page_highlights = [PageHighlight(
+            doc_id=doc_id,
+            page_nums=page_nums,
+            context=self._extract_reasoning(conversation_history)
+        )]
+        
+        # Also highlight the document itself
+        document_highlights = []
+        if doc:
+            significant_pages = [p.page_num for p in doc.pages if p.legally_significant]
+            page_summaries = {p.page_num: p.summary for p in doc.pages}
+            
+            document_highlights.append(DocumentHighlight(
+                doc_id=doc.id,
+                reason="Pages requested for detailed review",
+                legally_significant_pages=significant_pages,
+                all_pages_summary=page_summaries
+            ))
+        
+        return ApprovalContext(
+            request_id=str(uuid4()),
+            tool_name="get_page_text",
+            tool_args=tool_args,
+            allowed_decisions=["approve", "edit", "reject"],
+            document_highlights=document_highlights,
+            page_highlights=page_highlights,
+            file_highlights=[],
+            agent_reasoning=self._extract_reasoning(conversation_history),
+            related_todos=self._extract_todos(conversation_history),
+            timestamp=datetime.utcnow().isoformat()
+        )
+    
+    async def _build_file_context(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        conversation_history: List[Any]
+    ) -> ApprovalContext:
+        """Build context for file write/edit approval."""
+        
+        file_path = tool_args.get("file_path", "")
+        content = tool_args.get("content", "") or tool_args.get("new_string", "")
+        
+        # Preview content (first 200 chars)
+        content_preview = content[:200] + "..." if len(content) > 200 else content
+        
+        file_highlights = [FileHighlight(
+            file_path=file_path,
+            operation="write" if tool_name == "write_file" else "edit",
+            content_preview=content_preview
+        )]
+        
+        return ApprovalContext(
+            request_id=str(uuid4()),
+            tool_name=tool_name,
+            tool_args=tool_args,
+            allowed_decisions=["approve", "edit", "reject"],
+            document_highlights=[],
+            page_highlights=[],
+            file_highlights=file_highlights,
+            agent_reasoning=self._extract_reasoning(conversation_history),
+            related_todos=self._extract_todos(conversation_history),
+            timestamp=datetime.utcnow().isoformat()
+        )
+    
+    def _extract_reasoning(self, conversation_history: List[Any]) -> str:
+        """Extract agent's most recent reasoning from conversation."""
+        
+        for msg in reversed(conversation_history[-5:]):
+            if hasattr(msg, 'content') and isinstance(msg.content, str):
+                if len(msg.content) > 50:  # Skip very short messages
+                    return msg.content[:500]
+        
+        return "Continuing with analysis task"
+    
+    def _extract_reason(self, doc_id: str, conversation_history: List[Any]) -> str:
+        """Extract why agent wants this specific document."""
+        
+        for msg in reversed(conversation_history[-10:]):
+            if hasattr(msg, 'content') and doc_id in str(msg.content):
+                # Find sentence mentioning this document
+                content = str(msg.content)
+                sentences = content.split('.')
+                for sentence in sentences:
+                    if doc_id in sentence:
+                        return sentence.strip()[:200]
+        
+        return "Document requested for review"
+    
+    def _extract_todos(self, conversation_history: List[Any]) -> List[str]:
+        """Extract current in-progress todos from conversation."""
+        
+        # Look for write_todos tool calls
+        todos = []
+        for msg in reversed(conversation_history[-20:]):
+            if hasattr(msg, 'tool_calls'):
+                for tool_call in msg.tool_calls:
+                    if tool_call.get('name') == 'write_todos':
+                        args = tool_call.get('args', {})
+                        task_list = args.get('tasks', [])
+                        todos = [
+                            task['description']
+                            for task in task_list
+                            if task.get('status') == 'in_progress'
+                        ]
+                        if todos:
+                            return todos[:3]  # Return up to 3 current tasks
+        
+        return []
+    
+    async def _build_generic_context(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        conversation_history: List[Any]
+    ) -> ApprovalContext:
+        """Build generic context for unknown tool types."""
+        
+        return ApprovalContext(
+            request_id=str(uuid4()),
+            tool_name=tool_name,
+            tool_args=tool_args,
+            allowed_decisions=["approve", "reject"],
+            document_highlights=[],
+            page_highlights=[],
+            file_highlights=[],
+            agent_reasoning=self._extract_reasoning(conversation_history),
+            related_todos=self._extract_todos(conversation_history),
+            timestamp=datetime.utcnow().isoformat()
+        )
+```
+
+## Frontend Implementation
+
+### API Client
+
+```typescript
+// frontend/src/api/client.ts
+const API_BASE = 'http://localhost:8000/api';
+
+export interface Document {
+  id: string;
+  filename: string;
+  summary: string;
+  pages: number;
+  uploaded_at: string;
+}
+
+export interface DocumentDetail extends Document {
+  pages: Array<{
+    num: number;
+    summary: string;
+    legally_significant: boolean;
+  }>;
+}
+
+export interface Session {
+  session_id: string;
+  status: string;
+  documents: number;
+}
+
+export const api = {
+  // Start a new due diligence session
+  async startSession(projectName: string, documentIds: string[]): Promise<Session> {
+    const response = await fetch(`${API_BASE}/sessions/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_name: projectName,
+        document_ids: documentIds
+      })
+    });
+    
+    if (!response.ok) throw new Error('Failed to start session');
+    return response.json();
+  },
+  
+  // Upload a document
+  async uploadDocument(file: File): Promise<Document> {
+    const formData = new FormData();
+    formData.append('file', file);
+    
+    const response = await fetch(`${API_BASE}/documents/upload`, {
+      method: 'POST',
+      body: formData
+    });
+    
+    if (!response.ok) throw new Error('Failed to upload document');
+    return response.json();
+  },
+  
+  // List all documents
+  async listDocuments(): Promise<{ documents: Document[] }> {
+    const response = await fetch(`${API_BASE}/documents`);
+    if (!response.ok) throw new Error('Failed to list documents');
+    return response.json();
+  },
+  
+  // Get document details
+  async getDocument(documentId: string): Promise<DocumentDetail> {
+    const response = await fetch(`${API_BASE}/documents/${documentId}`);
+    if (!response.ok) throw new Error('Failed to get document');
+    return response.json();
+  }
+};
+```
+
+### Zustand Store (Refined)
+
+```typescript
+// frontend/src/stores/appStore.ts
+import create from 'zustand';
+import { devtools } from 'zustand/middleware';
+
+export interface Document {
+  id: string;
+  filename: string;
+  summary: string;
+  pageCount: number;
+  pages?: DocumentPage[];
+}
+
+export interface DocumentPage {
+  num: number;
+  summary: string;
+  legallySignificant: boolean;
+}
+
+export interface ApprovalRequest {
+  requestId: string;
+  toolName: string;
+  toolArgs: Record<string, any>;
+  allowedDecisions: string[];
+  documentHighlights: Array<{
+    docId: string;
+    reason: string;
+    legallySignificantPages: number[];
+    allPagesSummary: Record<number, string>;
+  }>;
+  pageHighlights: Array<{
+    docId: string;
+    pageNums: number[];
+    context: string;
+  }>;
+  fileHighlights: Array<{
+    filePath: string;
+    operation: 'write' | 'edit';
+    contentPreview: string;
+  }>;
+  agentReasoning: string;
+  relatedTodos: string[];
+}
+
+type UIState =
+  | { type: 'idle' }
+  | { type: 'agent_running' }
+  | { type: 'awaiting_approval'; request: ApprovalRequest }
+  | { type: 'completed' };
+
+interface AppState {
+  sessionId: string | null;
+  ws: WebSocket | null;
+  uiState: UIState;
+  
+  documents: Document[];
+  selectedDocumentId: string | null;
+  highlightedDocumentIds: Set<string>;
+  highlightedPages: Map<string, Set<number>>;
+  
+  files: Map<string, string>;
+  selectedFilePath: string | null;
+  highlightedFilePaths: Set<string>;
+  
+  currentPdfPage: number;
+  
+  connect: (sessionId: string) => void;
+  submitDecision: (decision: any) => void;
+  selectDocument: (docId: string) => void;
+  setDocuments: (docs: Document[]) => void;
+}
+
+export const useAppStore = create<AppState>()(
+  devtools((set, get) => ({
+    sessionId: null,
+    ws: null,
+    uiState: { type: 'idle' },
+    documents: [],
+    selectedDocumentId: null,
+    highlightedDocumentIds: new Set(),
+    highlightedPages: new Map(),
+    files: new Map(),
+    selectedFilePath: null,
+    highlightedFilePaths: new Set(),
+    currentPdfPage: 1,
+    
+    connect: (sessionId: string) => {
+      const ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`);
+      
+      ws.onopen = () => {
+        console.log('WebSocket connected');
+        set({ sessionId, ws, uiState: { type: 'agent_running' } });
+      };
+      
+      ws.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+        
+        switch (message.type) {
+          case 'approval_request':
+            const request = message.data as ApprovalRequest;
+            
+            // Extract highlights
+            const docIds = new Set(request.documentHighlights.map(dh => dh.docId));
+            const pageHighlights = new Map<string, Set<number>>();
+            
+            request.documentHighlights.forEach(dh => {
+              pageHighlights.set(dh.docId, new Set(dh.legallySignificantPages));
+            });
+            
+            request.pageHighlights.forEach(ph => {
+              const existing = pageHighlights.get(ph.docId) || new Set();
+              ph.pageNums.forEach(num => existing.add(num));
+              pageHighlights.set(ph.docId, existing);
+            });
+            
+            const fileHighlights = new Set(request.fileHighlights.map(fh => fh.filePath));
+            
+            set({
+              uiState: { type: 'awaiting_approval', request },
+              highlightedDocumentIds: docIds,
+              highlightedPages: pageHighlights,
+              highlightedFilePaths: fileHighlights,
+              selectedDocumentId: docIds.size > 0 ? Array.from(docIds)[0] : get().selectedDocumentId
+            });
+            break;
+          
+          case 'agent_resuming':
+            set({ 
+              uiState: { type: 'agent_running' },
+              highlightedDocumentIds: new Set(),
+              highlightedPages: new Map(),
+              highlightedFilePaths: new Set()
+            });
+            break;
+          
+          case 'agent_completed':
+            set({ uiState: { type: 'completed' } });
+            break;
+        }
+      };
+      
+      set({ sessionId, ws });
+    },
+    
+    submitDecision: (decision: any) => {
+      const { ws, uiState } = get();
+      
+      if (!ws || uiState.type !== 'awaiting_approval') return;
+      
+      ws.send(JSON.stringify({
+        type: 'approval_decision',
+        request_id: uiState.request.requestId,
+        decision
+      }));
+    },
+    
+    selectDocument: (docId: string) => {
+      set({ selectedDocumentId: docId, currentPdfPage: 1 });
+    },
+    
+    setDocuments: (docs: Document[]) => {
+      set({ documents: docs });
+    }
+  }))
+);
+```
+
+### Key Components
+
+```typescript
+// frontend/src/components/DocumentList.tsx
+import React from 'react';
+import { useAppStore } from '../stores/appStore';
+
+export const DocumentList: React.FC = () => {
+  const documents = useAppStore(state => state.documents);
+  const selectedId = useAppStore(state => state.selectedDocumentId);
+  const highlightedIds = useAppStore(state => state.highlightedDocumentIds);
+  const selectDocument = useAppStore(state => state.selectDocument);
+  
+  return (
+    <div className="document-list">
+      <div className="panel-header">
+        <h3>Data Room Documents</h3>
+      </div>
+      <div className="document-items">
+        {documents.map(doc => {
+          const isHighlighted = highlightedIds.has(doc.id);
+          const isSelected = selectedId === doc.id;
+          
+          return (
+            <div
+              key={doc.id}
+              className={`
+                document-item
+                ${isHighlighted ? 'highlighted' : ''}
+                ${isSelected ? 'selected' : ''}
+              `}
+              onClick={() => selectDocument(doc.id)}
+            >
+              {isHighlighted && (
+                <div className="highlight-indicator">
+                  <span className="highlight-badge">Agent Requested</span>
+                </div>
+              )}
+              <div className="document-title">{doc.filename}</div>
+              <div className="document-summary">{doc.summary}</div>
+              <div className="document-meta">{doc.pageCount} pages</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+```
+
+```typescript
+// frontend/src/components/ApprovalPanel.tsx
+import React, { useState } from 'react';
+import { useAppStore } from '../stores/appStore';
+
+export const ApprovalPanel: React.FC = () => {
+  const uiState = useAppStore(state => state.uiState);
+  const submitDecision = useAppStore(state => state.submitDecision);
+  
+  const [isEditing, setIsEditing] = useState(false);
+  const [editedArgs, setEditedArgs] = useState<Record<string, any>>({});
+  
+  if (uiState.type !== 'awaiting_approval') return null;
+  
+  const { request } = uiState;
+  const canEdit = request.allowedDecisions.includes('edit');
+  const canReject = request.allowedDecisions.includes('reject');
+  
+  const handleApprove = () => {
+    submitDecision({ type: 'approve' });
+  };
+  
+  const handleEdit = () => {
+    if (isEditing) {
+      submitDecision({
+        type: 'edit',
+        edited_action: {
+          name: request.toolName,
+          args: editedArgs
+        }
+      });
+    } else {
+      setEditedArgs(request.toolArgs);
+      setIsEditing(true);
+    }
+  };
+  
+  const handleReject = () => {
+    submitDecision({ type: 'reject' });
+  };
+  
+  return (
+    <div className="approval-panel-overlay">
+      <div className="approval-panel">
+        <div className="approval-header">
+          <h2>Approval Required</h2>
+          <span className="tool-badge">{request.toolName}</span>
+        </div>
+        
+        <div className="approval-content">
+          <div className="section">
+            <h3>Agent's Intent</h3>
+            <p>{request.agentReasoning}</p>
+          </div>
+          
+          {request.relatedTodos.length > 0 && (
+            <div className="section">
+              <h3>Related Tasks</h3>
+              <ul>
+                {request.relatedTodos.map((todo, i) => (
+                  <li key={i}>{todo}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          
+          <div className="section">
+            <h3>Requested Action</h3>
+            {isEditing ? (
+              <textarea
+                value={JSON.stringify(editedArgs, null, 2)}
+                onChange={(e) => setEditedArgs(JSON.parse(e.target.value))}
+                rows={10}
+                className="args-editor"
+              />
+            ) : (
+              <pre className="args-display">
+                {JSON.stringify(request.toolArgs, null, 2)}
+              </pre>
+            )}
+          </div>
+          
+          {request.documentHighlights.length > 0 && (
+            <div className="section">
+              <h3>Documents ({request.documentHighlights.length})</h3>
+              {request.documentHighlights.map(dh => (
+                <div key={dh.docId} className="doc-highlight-info">
+                  <strong>{dh.docId}</strong>
+                  <p>{dh.reason}</p>
+                  <span className="page-badge">
+                    {dh.legallySignificantPages.length} significant pages
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        
+        <div className="approval-actions">
+          <button className="btn btn-approve" onClick={handleApprove}>
+            ✓ Approve
+          </button>
+          
+          {canEdit && (
+            <button className="btn btn-edit" onClick={handleEdit}>
+              {isEditing ? '✓ Confirm Edit' : '✎ Edit'}
+            </button>
+          )}
+          
+          {canReject && (
+            <button className="btn btn-reject" onClick={handleReject}>
+              ✗ Reject
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+```
+
+```typescript
+// frontend/src/components/PDFViewer.tsx
+import React, { useEffect, useRef } from 'react';
+import { useAppStore } from '../stores/appStore';
+import * as pdfjsLib from 'pdfjs-dist';
+
+export const PDFViewer: React.FC = () => {
+  const selectedDocId = useAppStore(state => state.selectedDocumentId);
+  const highlightedPages = useAppStore(state => state.highlightedPages);
+  const currentPage = useAppStore(state => state.currentPdfPage);
+  
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  
+  useEffect(() => {
+    if (!selectedDocId || !canvasRef.current) return;
+    
+    // Load and render PDF
+    const loadPdf = async () => {
+      const pdf = await pdfjsLib.getDocument(`/api/documents/${selectedDocId}/pdf`).promise;
+      const page = await pdf.getPage(currentPage);
+      
+      const canvas = canvasRef.current!;
+      const context = canvas.getContext('2d')!;
+      
+      const viewport = page.getViewport({ scale: 1.5 });
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      
+      await page.render({ canvasContext: context, viewport }).promise;
+      
+      // Highlight pages if needed
+      const highlights = highlightedPages.get(selectedDocId);
+      if (highlights?.has(currentPage)) {
+        context.strokeStyle = 'rgba(255, 165, 0, 0.5)';
+        context.lineWidth = 4;
+        context.strokeRect(0, 0, canvas.width, canvas.height);
+      }
+    };
+    
+    loadPdf();
+  }, [selectedDocId, currentPage, highlightedPages]);
+  
+  if (!selectedDocId) {
+    return (
+      <div className="pdf-viewer-empty">
+        <p>Select a document to view</p>
+      </div>
+    );
+  }
+  
+  return (
+    <div className="pdf-viewer">
+      <div className="pdf-toolbar">
+        <button>Previous</button>
+        <span>Page {currentPage}</span>
+        <button>Next</button>
+      </div>
+      <canvas ref={canvasRef} />
+    </div>
+  );
+};
+```
+
+This implementation provides a working foundation. The key aspects:
+
+1. **Backend**: FastAPI with async support, WebSocket for real-time communication
+2. **Agent Integration**: DeepAgents with custom tools and approval workflow
+3. **Frontend**: React with Zustand for state, WebSocket for real-time updates
+4. **Approval System**: Rich context building, visual feedback, decision routing
+
+Deploy with Docker Compose for the complete stack. Need specific deployment configs or additional components?
